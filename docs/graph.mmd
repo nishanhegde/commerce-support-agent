@@ -1,0 +1,24 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	classify(classify)
+	handle_order(handle_order)
+	handle_returns(handle_returns)
+	handle_other(handle_other)
+	respond(respond)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> classify;
+	classify -.-> handle_order;
+	classify -.-> handle_other;
+	classify -.-> handle_returns;
+	handle_order --> respond;
+	handle_other --> respond;
+	handle_returns --> respond;
+	respond --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
