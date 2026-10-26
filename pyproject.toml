@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "langchain-anthropic>=1.7.6",
     "langgraph>=1.2.15",
+    "langgraph-checkpoint-sqlite>=3.1.2",
     "python-dotenv>=1.2.4",
 ]
 

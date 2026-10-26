@@ -1,4 +1,5 @@
-"""Day 42: two tools, as LangChain `@tool` functions.
+"""Day 42: two tools, as LangChain `@tool` functions. Day 44 adds a third,
+`cancel_order`, the first one that changes anything.
 
 Compare with Month 1's tools.py: there, a tool was a hand-written JSON schema
 dict plus a separate entry in an IMPLEMENTATIONS map. Here `@tool` derives the
@@ -82,4 +83,38 @@ def search_products(keywords: list[str], max_price: int | None = None) -> list[d
     ]
 
 
-TOOLS = [get_order_status, search_products]
+@tool
+def cancel_order(order_id: str, reason: str) -> dict:
+    """Cancel an order that has not shipped yet. This cannot be undone.
+
+    Call this only when the customer has clearly asked to cancel a specific
+    order. A human approves or rejects each call before it runs, so the
+    review is already over when you see the result: `cancelled: true` is
+    final, and a "rejected by a human reviewer" error means the order was
+    not cancelled.
+
+    Args:
+        order_id: The order number, digits only.
+        reason: The customer's reason for cancelling, in a few words.
+    """
+    order = ORDERS.get(order_id)
+    if order is None:
+        return {"found": False, "order_id": order_id}
+    # Shipped or delivered orders go through returns, not cancellation. Like
+    # a missing order, that's a business answer, so it's data, not an error.
+    if order["status"] != "pending":
+        return {
+            "cancelled": False,
+            "order_id": order_id,
+            "why": f"order is {order['status']}; only pending orders can be cancelled",
+        }
+    order["status"] = "cancelled"
+    order["cancel_reason"] = reason
+    return {"cancelled": True, "order_id": order_id}
+
+
+TOOLS = [get_order_status, search_products, cancel_order]
+
+# Tools the graph will not run without a human saying yes (Day 44). A set of
+# names, not a flag on the tool, so the policy lives in one place you can read.
+NEEDS_APPROVAL = {"cancel_order"}

@@ -23,6 +23,12 @@ Two stopping mechanisms, and they are different things:
     (one per node execution here) and raises GraphRecursionError. Every graph
     has one; default is 25. It exists for when your own guard is missing or
     wrong.
+
+Day 44 adds one node, `approve`, between `agent` and `tools`, reached only
+when the model asks for a tool in NEEDS_APPROVAL:
+
+    agent -> approve -> tools -> agent      (cancel: pause for a human first)
+    agent -> tools -> agent                 (lookups: unchanged)
 """
 
 import json
@@ -32,11 +38,13 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import ToolException
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import create_react_agent
+from langgraph.types import interrupt
 from pydantic import ValidationError
 
-from support_agent.tools import TOOLS
+from support_agent.tools import NEEDS_APPROVAL, TOOLS
 
 MODEL = "claude-opus-5"
 
@@ -82,9 +90,17 @@ class AgentState(MessagesState):
     # `iterations` has no reducer, so the latest write wins. It's read with
     # .get(..., 0) because callers start the graph with only `messages`.
     iterations: int
+    # Day 44: tool_call id -> the reviewer's reason, for calls a human said no
+    # to. Written by `approve`, read by `tools`. No reducer, so each approval
+    # replaces the last; stale ids are harmless because ids never repeat.
+    rejected: dict[str, str]
 
 
-def build_explicit(model: BaseChatModel | None = None, max_iterations: int = 6):
+def build_explicit(
+    model: BaseChatModel | None = None,
+    max_iterations: int = 6,
+    checkpointer: BaseCheckpointSaver | None = None,
+):
     # bind_tools attaches the tool schemas to every request, like passing
     # `tools=TOOLS` to client.messages.create in Month 1.
     llm = (model or default_model()).bind_tools(TOOLS)
@@ -102,10 +118,17 @@ def build_explicit(model: BaseChatModel | None = None, max_iterations: int = 6):
         # (langgraph.prebuilt.ToolNode does this for you. Written out here so
         # it's visible.)
         last: AIMessage = state["messages"][-1]
+        rejected = state.get("rejected", {})
         results = []
         for call in last.tool_calls:
             tool = TOOLS_BY_NAME.get(call["name"])
-            if tool is None:
+            if call["id"] in rejected:
+                # Every tool_use still needs a tool_result, or the next API
+                # call is invalid. A rejection is that result: the model
+                # reads it and tells the customer.
+                content = {"error": f"rejected by a human reviewer: {rejected[call['id']]}"}
+                status = "error"
+            elif tool is None:
                 content, status = {"error": f"no such tool: {call['name']}"}, "error"
             else:
                 try:
@@ -127,6 +150,29 @@ def build_explicit(model: BaseChatModel | None = None, max_iterations: int = 6):
         # (the Day 7 rule) without us doing it by hand.
         return {"messages": results}
 
+    def approve(state: AgentState) -> dict:
+        # Day 44. interrupt() pauses the graph here: the checkpointer saves the
+        # state, and invoke()/stream() return to the caller. The caller resumes
+        # with Command(resume=decision), and interrupt() then *returns* that
+        # decision.
+        #
+        # The catch: on resume, LangGraph re-runs this node from its first
+        # line, not from the interrupt() call. Python can't freeze a function
+        # mid-call, so "resume" means "run it again, and this time interrupt()
+        # returns instead of pausing". Anything before interrupt() runs twice.
+        # That's why approval is its own node with no side effects, rather
+        # than an interrupt() inside `tools`, where a read-only tool batched
+        # alongside the cancel would run once before the pause and again after.
+        last: AIMessage = state["messages"][-1]
+        pending = [c for c in last.tool_calls if c["name"] in NEEDS_APPROVAL]
+        decision = interrupt({"tool_calls": pending})
+        # One decision covers every gated call in this turn. Per-call
+        # decisions would be the same shape with a list.
+        if decision.get("approved"):
+            return {"rejected": {}}
+        reason = decision.get("reason") or "no reason given"
+        return {"rejected": {c["id"]: reason for c in pending}}
+
     def give_up(state: AgentState) -> dict:
         return {
             "messages": [
@@ -134,11 +180,16 @@ def build_explicit(model: BaseChatModel | None = None, max_iterations: int = 6):
             ]
         }
 
-    def route_after_agent(state: AgentState) -> Literal["tools", "__end__"]:
+    def route_after_agent(state: AgentState) -> Literal["approve", "tools", "__end__"]:
         # Month 1: `if response.stop_reason != "tool_use": break`.
         # LangChain normalises stop_reason away. Checking tool_calls is the
         # provider-neutral equivalent (and what prebuilt `tools_condition` does).
-        return "tools" if state["messages"][-1].tool_calls else END
+        calls = state["messages"][-1].tool_calls
+        if not calls:
+            return END
+        # Day 44: only turns that touch a gated tool stop for a human. Lookups
+        # go straight through.
+        return "approve" if any(c["name"] in NEEDS_APPROVAL for c in calls) else "tools"
 
     def route_after_tools(state: AgentState) -> Literal["agent", "give_up"]:
         # The guard sits *before* the next model call, as in Month 1, so a
@@ -148,19 +199,30 @@ def build_explicit(model: BaseChatModel | None = None, max_iterations: int = 6):
     g = StateGraph(AgentState)
     g.add_node("agent", agent)
     g.add_node("tools", tools)
+    g.add_node("approve", approve)
     g.add_node("give_up", give_up)
     g.add_edge(START, "agent")
+    g.add_edge("approve", "tools")
     # No path_map this time: the Literal return types tell LangGraph the
     # possible targets, so the drawn graph still shows every branch.
     g.add_conditional_edges("agent", route_after_agent)
     g.add_conditional_edges("tools", route_after_tools)
     g.add_edge("give_up", END)
-    return g.compile()
+    # Day 43: with a checkpointer, every superstep's state is saved under the
+    # caller's thread_id. Without one, state lives only for one invoke().
+    # Day 44: interrupt() needs one, since a pause is just a saved checkpoint.
+    # Without it, a turn that reaches `approve` still stops, but nothing was
+    # saved to come back to: resuming raises.
+    return g.compile(checkpointer=checkpointer)
 
 
 def final_text(result: dict) -> str:
-    """The last message's text. Claude's content may be a list of blocks."""
-    msg = result["messages"][-1]
+    """The last message's text."""
+    return message_text(result["messages"][-1])
+
+
+def message_text(msg) -> str:
+    """A message's text. Claude's content may be a list of blocks."""
     if isinstance(msg.content, str):
         return msg.content
     return "".join(b.get("text", "") for b in msg.content if isinstance(b, dict))

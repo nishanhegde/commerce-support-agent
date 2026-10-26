@@ -80,7 +80,7 @@ def test_parallel_tool_calls_each_get_a_result():
 @pytest.mark.parametrize(
     "bad_call",
     [
-        call("cancel_order", {"order_id": "1042"}),  # no such tool
+        call("refund_order", {"order_id": "1042"}),  # no such tool
         call("get_order_status", {}),  # missing required argument
     ],
 )

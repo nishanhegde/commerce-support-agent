@@ -15,3 +15,6 @@ wheels/
 # Runtime output, not source
 conversations/
 logs/
+
+# Day 43 checkpoint database
+data/

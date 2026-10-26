@@ -1,0 +1,31 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	extract(extract)
+	answer(answer)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> extract;
+	context\3amerge --> answer;
+	extract -.-> answer;
+	extract -.-> context\3a__start__;
+	answer --> __end__;
+	subgraph context
+	context\3a__start__(<p>__start__</p>)
+	context\3aorder(order)
+	context\3ashipment(shipment)
+	context\3apayment(payment)
+	context\3amerge(merge)
+	context\3a__start__ --> context\3aorder;
+	context\3a__start__ --> context\3apayment;
+	context\3a__start__ --> context\3ashipment;
+	context\3aorder --> context\3amerge;
+	context\3apayment --> context\3amerge;
+	context\3ashipment --> context\3amerge;
+	end
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
