@@ -14,6 +14,10 @@ The rules, in the order they're applied:
     2. The order must be delivered. A pending order is     -> stops here, with
        cancelled, not returned; an in-transit one hasn't      what to do instead
        arrived yet.
+       Day 50 exception: in transit and more than 7 days     -> eligible as a
+       past its estimate. The parcel is recalled from the       delayed-shipment
+       carrier; the customer sends nothing back. Rules 3-4      refund
+       don't apply (it was never delivered or opened).
     3. Category: some categories can never go back         -> each failing rule
        (hygiene). Some have a shorter window.                 adds a reason;
     4. Window: N days from *delivery*, not from order.        all are reported
@@ -29,7 +33,8 @@ fixing one and then hitting the next.
 Returns are an OMS concern, not a storefront one, so these tools read the
 in-memory ORDERS rather than mcp-commerce: its get_order_status has no
 delivery date and no categories. Day 50's end-to-end run is where that gap
-has to be closed.
+has to be closed. (It still is: the Day 50 scenario runs on this in-memory
+data too.)
 """
 
 import itertools
@@ -45,6 +50,9 @@ DEFAULT_WINDOW_DAYS = 30
 WINDOW_DAYS = {"electronics": 10}
 # Category -> the reason a customer is given. Never returnable, at any age.
 NON_RETURNABLE = {"foot-care": "insoles and foot-care items can't be returned for hygiene reasons"}
+# Day 50: an in-transit order this many days past its estimated delivery can
+# be refunded without waiting for it to arrive.
+LATE_REFUND_DAYS = 7
 
 # Open returns, by return id. Module-level and in-memory, like ORDERS; the
 # test conftest resets it.
@@ -87,6 +95,9 @@ def eligibility(order: dict | None, sku: str, quantity: int, on: date) -> dict:
 
     result = {"order_id": order["order_id"], "sku": sku, "name": line["name"]}
 
+    if order["status"] == "in_transit" and _days_late(order, on) > LATE_REFUND_DAYS:
+        return {**_quantity_check(result, order, line, sku, quantity, []), "delayed_shipment": True}
+
     if order["status"] != "delivered":
         instead = {
             "pending": "it hasn't shipped, so it can be cancelled instead",
@@ -110,6 +121,20 @@ def eligibility(order: dict | None, sku: str, quantity: int, on: date) -> dict:
             f"this was delivered {delivered.isoformat()}, so the window closed {return_by.isoformat()}"
         )
 
+    result = _quantity_check(result, order, line, sku, quantity, reasons)
+    if result["eligible"]:
+        result["return_by"] = return_by.isoformat()
+    return result
+
+
+def _days_late(order: dict, on: date) -> int:
+    eta = order.get("estimated_delivery")
+    return (on - date.fromisoformat(eta)).days if eta else 0
+
+
+def _quantity_check(result: dict, order: dict, line: dict, sku: str, quantity: int, reasons: list[str]) -> dict:
+    """Rule 5, then the verdict. Shared by the delivered path and Day 50's
+    delayed-shipment path, which skips rules 3-4 but not this one."""
     open_qty = already_returning(order["order_id"], sku)
     returnable_qty = line["qty"] - open_qty
     if quantity < 1:
@@ -118,11 +143,10 @@ def eligibility(order: dict | None, sku: str, quantity: int, on: date) -> dict:
         already = f" ({open_qty} already on an open return)" if open_qty else ""
         reasons.append(f"only {returnable_qty} of {line['qty']} can be returned{already}")
 
-    result["eligible"] = not reasons
+    result = {**result, "eligible": not reasons}
     if reasons:
         result["reasons"] = reasons
     else:
-        result["return_by"] = return_by.isoformat()
         result["refund_amount"] = quantity * line["unit_price"]
     return result
 
@@ -136,6 +160,10 @@ def check_return_eligibility(order_id: str, sku: str, quantity: int = 1) -> dict
     are final policy: don't offer the return anyway. If the order has several
     items and the customer hasn't said which, check each one.
 
+    Also call it when a customer wants a refund on a shipped order that is
+    late: one well past its estimate comes back eligible with
+    `delayed_shipment: true`, meaning a refund without waiting for delivery.
+
     Args:
         order_id: The order number, digits only.
         sku: The item's SKU, as get_order_status lists it.
@@ -148,7 +176,8 @@ def check_return_eligibility(order_id: str, sku: str, quantity: int = 1) -> dict
 def create_return(order_id: str, sku: str, quantity: int, reason: str) -> dict:
     """Open a return for an item and issue a return id. The refund is paid
     to the original payment method once the item arrives back and passes
-    inspection, not now.
+    inspection, not now. For a delayed shipment, the parcel is recalled
+    from the carrier instead, and the result's next_step says what happens.
 
     Call this only after check_return_eligibility said eligible AND the
     customer has confirmed they want to go ahead. A human approves each call
@@ -170,20 +199,25 @@ def create_return(order_id: str, sku: str, quantity: int, reason: str) -> dict:
         return {"created": False, **check}
 
     return_id = f"RMA-{order_id}-{next(_return_seq)}"
+    delayed = check.get("delayed_shipment", False)
     RETURNS[return_id] = {
         "return_id": return_id,
         "order_id": order_id,
         "sku": sku,
         "quantity": quantity,
         "reason": reason,
-        "status": "awaiting_item",
+        # Day 50: a late parcel is recalled from the carrier, so there's
+        # nothing for the customer to send and nothing to inspect.
+        "status": "carrier_recall" if delayed else "awaiting_item",
         "refund_amount": check["refund_amount"],
     }
-    return {
-        "created": True,
-        **RETURNS[return_id],
-        "next_step": f"ship the item back by {check['return_by']}; refund follows inspection",
-    }
+    next_step = (
+        "nothing to send back; if the parcel still turns up, refuse delivery. "
+        "Refund goes to the original payment method once the carrier confirms the recall"
+        if delayed
+        else f"ship the item back by {check['return_by']}; refund follows inspection"
+    )
+    return {"created": True, **RETURNS[return_id], "next_step": next_step}
 
 
 @tool
@@ -193,7 +227,8 @@ def escalate_to_human(summary: str, reason: str, priority: Literal["normal", "ur
 
     Call this when the customer asks for a person, when they dispute a policy
     answer you can't change, or when they need something your tools can't do.
-    Give the customer the ticket id. Don't promise a response time.
+    Give the customer the ticket id and say a person will review it. Don't
+    promise how or when they'll be contacted: this tool doesn't decide that.
 
     Args:
         summary: What the customer wants and what you've already checked, so

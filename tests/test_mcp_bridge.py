@@ -15,6 +15,7 @@ from langchain_core.tools import ToolException
 from support_agent.hitl import decision, pending_approval
 from support_agent.mcp_bridge import DEFAULT_SERVER_DIR, MCPBridge, mcp_commerce_server
 from support_agent.persistence import sqlite_checkpointer, thread, turn_input
+from support_agent.policy import by_name
 from support_agent.react import build_explicit, final_text
 from test_react import call, scripted
 
@@ -37,7 +38,7 @@ def mcp_graph(bridge, *responses, checkpointer=None):
         scripted(*responses),
         checkpointer=checkpointer,
         tools=bridge.tools,
-        needs_approval=bridge.needs_approval,
+        policy=by_name(bridge.needs_approval),
     )
 
 

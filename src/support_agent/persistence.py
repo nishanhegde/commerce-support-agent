@@ -25,9 +25,13 @@ from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.store.sqlite import SqliteStore
 from langgraph.types import StateSnapshot
 
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "checkpoints.sqlite"
+# Day 48: long-term memory gets its own file. Deleting checkpoints.sqlite
+# forgets every conversation; the customers are still remembered.
+STORE_PATH = DB_PATH.with_name("memory.sqlite")
 
 
 @contextmanager
@@ -41,6 +45,15 @@ def sqlite_checkpointer(path: Path = DB_PATH) -> Iterator[SqliteSaver]:
     path.parent.mkdir(exist_ok=True)
     with SqliteSaver.from_conn_string(str(path)) as saver:
         yield saver
+
+
+@contextmanager
+def sqlite_store(path: Path = STORE_PATH) -> Iterator[SqliteStore]:
+    """Day 48: the long-term Store over a file. Same shape as the saver."""
+    path.parent.mkdir(exist_ok=True)
+    with SqliteStore.from_conn_string(str(path)) as store:
+        store.setup()  # creates the tables on first use; a no-op after
+        yield store
 
 
 def thread(thread_id: str) -> dict:

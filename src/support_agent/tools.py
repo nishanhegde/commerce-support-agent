@@ -89,6 +89,19 @@ ORDERS = {
              "category": "electronics", "unit_price": 12999},
         ],
     },
+    # Day 50: the end-to-end scenario's order. Shipped, and 9 days past its
+    # estimate on 2026-10-27. Over ₹5,000, so any refund needs a human.
+    "1048": {
+        "order_id": "1048",
+        "status": "in_transit",
+        "carrier": "BlueDart",
+        "tracking_number": "BD-99110457",
+        "estimated_delivery": "2026-10-18",
+        "items": [
+            {"sku": "RS-4471-BLK", "name": "Trail Runner 4", "qty": 1,
+             "category": "footwear", "unit_price": 7999},
+        ],
+    },
 }
 
 PRODUCTS = [
@@ -169,8 +182,5 @@ def cancel_order(order_id: str, reason: str) -> dict:
 
 TOOLS = [get_order_status, search_products, cancel_order]
 
-# Tools the graph will not run without a human saying yes (Day 44). A set of
-# names, not a flag on the tool, so the policy lives in one place you can read.
-# Day 47: create_return (returns.py) joins it. Day 49 narrows that to refunds
-# over a threshold.
-NEEDS_APPROVAL = {"cancel_order", "create_return"}
+# Which of these need a human's approval lived here as a set of names from
+# Day 44. Day 49 moved it to policy.py, where it can depend on the arguments.

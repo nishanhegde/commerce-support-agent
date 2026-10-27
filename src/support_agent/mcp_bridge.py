@@ -62,7 +62,7 @@ class MCPBridge:
     """One MCP session, on a background event loop, usable from sync code.
 
         with MCPBridge(mcp_commerce_server()) as bridge:
-            graph = build_explicit(tools=bridge.tools, needs_approval=bridge.needs_approval)
+            graph = build_explicit(tools=bridge.tools, policy=by_name(bridge.needs_approval))
     """
 
     def __init__(self, server: StdioServerParameters, errlog_path: Path | None = None):

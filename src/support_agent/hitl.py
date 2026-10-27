@@ -65,7 +65,10 @@ def pending_approval(graph, config: dict) -> list[dict]:
     return [c for i in snap.interrupts for c in i.value["tool_calls"]]
 
 
-def decision(approved: bool, reason: str = "") -> Command:
+def decision(approved: bool, reason: str = "", reviewer: str = "unknown") -> Command:
     """The input that resumes a paused thread. Whatever goes in resume= is
-    what interrupt() returns inside `approve`."""
-    return Command(resume={"approved": approved, "reason": reason})
+    what interrupt() returns inside `approve`.
+
+    Day 49: `reviewer` is who decided. It goes into the approval log, so a
+    caller should always say; "unknown" in the log is a finding in itself."""
+    return Command(resume={"approved": approved, "reason": reason, "reviewer": reviewer})

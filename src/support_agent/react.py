@@ -29,6 +29,16 @@ when the model asks for a tool in `needs_approval`:
 
     agent -> approve -> tools -> agent      (cancel: pause for a human first)
     agent -> tools -> agent                 (lookups: unchanged)
+
+Day 48 adds `load_customer` at the front, on a thread's first turn only, when
+the graph has a Store (memory.py):
+
+    START -> load_customer -> agent ...     (first turn: who is this?)
+    START -> agent ...                      (later turns: already in state)
+
+Day 49 changes no edges. Who goes through `approve` is now decided by a
+policy function (policy.py) instead of a set of names, and every node runs
+inside `audited` (audit.py), which logs each transition.
 """
 
 import json
@@ -40,12 +50,17 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.store.base import BaseStore
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
+from support_agent.audit import AuditLog, audited
+from support_agent.memory import CustomerContext, customer_prompt, load_customer, save_customer_note
+from support_agent import returns
+from support_agent.policy import Policy, default_policy
 from support_agent.returns import RETURN_TOOLS
-from support_agent.tools import NEEDS_APPROVAL, TOOLS
+from support_agent.tools import TOOLS
 
 MODEL = "claude-opus-5"
 
@@ -58,11 +73,14 @@ request them together rather than one at a time. Be brief and concrete.
 For a return: check eligibility first and tell the customer the answer and
 the reasons. Create the return only once they confirm. If the customer asks
 for a person or disputes a policy answer, escalate to a human and give them
-the ticket id."""
+the ticket id.
+
+When the customer tells you something that will matter next time (a size, a
+contact preference), save it as a customer note."""
 
 # Day 47: the graph's default tools are the order tools plus the return
 # tools. The prebuilt agent keeps the order tools: it's there for comparison.
-DEFAULT_TOOLS = [*TOOLS, *RETURN_TOOLS]
+DEFAULT_TOOLS = [*TOOLS, *RETURN_TOOLS, save_customer_note]
 
 
 def default_model() -> BaseChatModel:
@@ -102,6 +120,10 @@ class AgentState(MessagesState):
     # to. Written by `approve`, read by `tools`. No reducer, so each approval
     # replaces the last; stale ids are harmless because ids never repeat.
     rejected: dict[str, str]
+    # Day 48: the customer, read from the Store by `load_customer` on the
+    # first turn. Checkpointed with the rest of the state, so later turns,
+    # resumes and restarts all have it without reading the Store again.
+    customer: dict
 
 
 def build_explicit(
@@ -109,12 +131,21 @@ def build_explicit(
     max_iterations: int = 6,
     checkpointer: BaseCheckpointSaver | None = None,
     # Day 46: the graph no longer owns its tools. The defaults are the
-    # in-memory ones; mcp_bridge supplies mcp-commerce's, with an approval
-    # set taken from the server's annotations.
+    # in-memory ones; mcp_bridge supplies mcp-commerce's.
     tools: list[BaseTool] = DEFAULT_TOOLS,
-    needs_approval: set[str] = NEEDS_APPROVAL,
+    # Day 49: which calls need a human, as a function of the call. Was a set
+    # of names; policy.by_name(names) is that set as a policy.
+    policy: Policy = default_policy,
     system: str = SYSTEM,
+    # Day 48: long-term memory. With a Store, a thread's first turn loads the
+    # customer named in the call's context. Without one, the graph is as it was.
+    store: BaseStore | None = None,
+    # Day 49: where transitions and approvals go. None: an in-memory log, so
+    # the graph always has one and no node has to check.
+    audit: AuditLog | None = None,
 ):
+    audit = audit or AuditLog()
+
     # bind_tools attaches the tool schemas to every request, like passing
     # `tools=TOOLS` to client.messages.create in Month 1.
     llm = (model or default_model()).bind_tools(tools)
@@ -123,7 +154,12 @@ def build_explicit(
     def agent(state: AgentState) -> dict:
         # The system prompt is prepended per call rather than stored in state,
         # so it never gets duplicated into the history.
-        response = llm.invoke([SystemMessage(system), *state["messages"]])
+        # Day 48: plus the customer block, rebuilt from state each call.
+        # Day 50 fix (failures.md F4): plus today's date, or the model can't
+        # tell a late order from an on-time one. returns.today, looked up at
+        # call time, so tests that pin the date pin it here too.
+        prompt = f"{system}\n\nToday is {returns.today().isoformat()}." + customer_prompt(state.get("customer"))
+        response = llm.invoke([SystemMessage(prompt), *state["messages"]])
         return {"messages": [response], "iterations": state.get("iterations", 0) + 1}
 
     def run_tools(state: AgentState) -> dict:
@@ -141,11 +177,28 @@ def build_explicit(
                 # Every tool_use still needs a tool_result, or the next API
                 # call is invalid. A rejection is that result: the model
                 # reads it and tells the customer.
-                content = {"error": f"rejected by a human reviewer: {rejected[call['id']]}"}
+                # Day 50 fix (failures.md F6): say it's final, here, where
+                # the model reads it. Without this it escalated to a human to
+                # get the rejection overturned.
+                content = {
+                    "error": f"rejected by a human reviewer: {rejected[call['id']]}",
+                    "final": "This decision stands. Tell the customer plainly it was not "
+                    "approved. Don't retry it, and don't escalate to get it reversed "
+                    "unless the customer asks for a person.",
+                }
                 status = "error"
             elif tool is None:
                 content, status = {"error": f"no such tool: {call['name']}"}, "error"
             else:
+                # Day 49: a call that reaches here without a human was let
+                # through by a rule. Log that too: "who approved this ₹4,499
+                # refund?" needs an answer, and the answer is a rule id.
+                verdict = policy(call)
+                if verdict is not None and not verdict.human:
+                    audit.record(
+                        "approval", "auto_approved", node="tools", tool_call_id=call["id"],
+                        tool=call["name"], args=call["args"], by="policy", rule=verdict.rule, why=verdict.why,
+                    )
                 try:
                     content, status = tool.invoke(call["args"]), "success"
                 except (ValidationError, ToolException) as e:
@@ -180,14 +233,31 @@ def build_explicit(
         # That's why approval is its own node with no side effects, rather
         # than an interrupt() inside `tools`, where a read-only tool batched
         # alongside the cancel would run once before the pause and again after.
+        #
+        # Day 49: the policy decides what's pending, and its reason goes to
+        # the reviewer with the call. It runs on both passes (pause and
+        # resume), so it must give the same answer both times: it may read,
+        # never write.
         last: AIMessage = state["messages"][-1]
-        pending = [c for c in last.tool_calls if c["name"] in needs_approval]
+        pending = []
+        for c in last.tool_calls:
+            verdict = policy(c)
+            if verdict is not None and verdict.human:
+                pending.append({**c, "rule": verdict.rule, "why": verdict.why})
         decision = interrupt({"tool_calls": pending})
+        # Only the resume pass gets here, so each decision is logged once.
+        approved = bool(decision.get("approved"))
+        reason = decision.get("reason") or ("" if approved else "no reason given")
+        for c in pending:
+            audit.record(
+                "approval", "approved" if approved else "rejected", node="approve",
+                tool_call_id=c["id"], tool=c["name"], args=c["args"],
+                by=decision.get("reviewer", "unknown"), rule=c["rule"], why=c["why"], reason=reason,
+            )
         # One decision covers every gated call in this turn. Per-call
         # decisions would be the same shape with a list.
-        if decision.get("approved"):
+        if approved:
             return {"rejected": {}}
-        reason = decision.get("reason") or "no reason given"
         return {"rejected": {c["id"]: reason for c in pending}}
 
     def give_up(state: AgentState) -> dict:
@@ -206,19 +276,40 @@ def build_explicit(
             return END
         # Day 44: only turns that touch a gated tool stop for a human. Lookups
         # go straight through.
-        return "approve" if any(c["name"] in needs_approval for c in calls) else "tools"
+        # Day 49: "gated" is now the policy's call, per call and per argument.
+        gated = any((v := policy(c)) is not None and v.human for c in calls)
+        return "approve" if gated else "tools"
 
     def route_after_tools(state: AgentState) -> Literal["agent", "give_up"]:
         # The guard sits *before* the next model call, as in Month 1, so a
         # call that would go over the limit is never sent or paid for.
         return "give_up" if state["iterations"] >= max_iterations else "agent"
 
-    g = StateGraph(AgentState)
-    g.add_node("agent", agent)
-    g.add_node("tools", run_tools)
-    g.add_node("approve", approve)
-    g.add_node("give_up", give_up)
-    g.add_edge(START, "agent")
+    def route_start(state: AgentState) -> Literal["load_customer", "agent"]:
+        # "At session start" = the thread has no customer in state yet. The
+        # checkpoint answers that; there is no separate session object.
+        return "agent" if "customer" in state else "load_customer"
+
+    # context_schema declares what `context=` holds, as the state schema
+    # declares the state. Nodes receive it through their `runtime` parameter.
+    g = StateGraph(AgentState, context_schema=CustomerContext)
+
+    # Day 49: every node is registered wrapped, so every run of it is logged.
+    # Routing functions aren't wrapped: they change no state, and where they
+    # sent the run is the next row's `node`.
+    def add(name: str, fn) -> None:
+        g.add_node(name, audited(name, fn, audit))
+
+    add("agent", agent)
+    add("tools", run_tools)
+    add("approve", approve)
+    add("give_up", give_up)
+    if store is None:
+        g.add_edge(START, "agent")
+    else:
+        add("load_customer", load_customer)
+        g.add_conditional_edges(START, route_start)
+        g.add_edge("load_customer", "agent")
     g.add_edge("approve", "tools")
     # No path_map this time: the Literal return types tell LangGraph the
     # possible targets, so the drawn graph still shows every branch.
@@ -230,7 +321,9 @@ def build_explicit(
     # Day 44: interrupt() needs one, since a pause is just a saved checkpoint.
     # Without it, a turn that reaches `approve` still stops, but nothing was
     # saved to come back to: resuming raises.
-    return g.compile(checkpointer=checkpointer)
+    # Day 48: the Store sits next to the checkpointer. Every node and tool
+    # in the run can reach it through the Runtime.
+    return g.compile(checkpointer=checkpointer, store=store)
 
 
 def final_text(result: dict) -> str:
