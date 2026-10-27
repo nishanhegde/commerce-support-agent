@@ -143,6 +143,12 @@ def build_explicit(
     # Day 49: where transitions and approvals go. None: an in-memory log, so
     # the graph always has one and no node has to check.
     audit: AuditLog | None = None,
+    # Day 51: set when this graph runs as a supervisor's worker, so its audit
+    # rows say "returns_agent/tools" rather than a bare "tools".
+    name: str | None = None,
+    # Day 52: tools after which the run ends without another model call. A
+    # worker that has handed off has nothing left to say.
+    stop_after: frozenset[str] = frozenset(),
 ):
     audit = audit or AuditLog()
 
@@ -280,7 +286,12 @@ def build_explicit(
         gated = any((v := policy(c)) is not None and v.human for c in calls)
         return "approve" if gated else "tools"
 
-    def route_after_tools(state: AgentState) -> Literal["agent", "give_up"]:
+    def route_after_tools(state: AgentState) -> Literal["agent", "give_up", "__end__"]:
+        # Day 52: a stop_after tool ends the run here. The last AIMessage is
+        # the one whose calls the tools node just ran.
+        last_ai = next(m for m in reversed(state["messages"]) if isinstance(m, AIMessage))
+        if any(c["name"] in stop_after for c in last_ai.tool_calls):
+            return END
         # The guard sits *before* the next model call, as in Month 1, so a
         # call that would go over the limit is never sent or paid for.
         return "give_up" if state["iterations"] >= max_iterations else "agent"
@@ -297,8 +308,8 @@ def build_explicit(
     # Day 49: every node is registered wrapped, so every run of it is logged.
     # Routing functions aren't wrapped: they change no state, and where they
     # sent the run is the next row's `node`.
-    def add(name: str, fn) -> None:
-        g.add_node(name, audited(name, fn, audit))
+    def add(node: str, fn) -> None:
+        g.add_node(node, audited(f"{name}/{node}" if name else node, fn, audit))
 
     add("agent", agent)
     add("tools", run_tools)

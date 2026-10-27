@@ -32,6 +32,7 @@ from pathlib import Path
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.config import get_config
 from langgraph.errors import GraphInterrupt
+from langgraph.types import Command
 
 AUDIT_PATH = Path(__file__).resolve().parents[2] / "data" / "audit.sqlite"
 
@@ -40,7 +41,7 @@ CREATE TABLE IF NOT EXISTS audit (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     at        TEXT NOT NULL,
     thread_id TEXT NOT NULL,
-    kind      TEXT NOT NULL,   -- 'transition' | 'approval'
+    kind      TEXT NOT NULL,   -- 'transition' | 'approval' | 'handoff' (Day 52) | 'conflict' (Day 53) | 'escalation' (Day 54)
     step      INTEGER,
     node      TEXT,
     outcome   TEXT NOT NULL,   -- completed/paused/failed | auto_approved/approved/rejected
@@ -143,9 +144,16 @@ def audited(name: str, fn, log: AuditLog):
     return node
 
 
-def summarise(update: dict | None) -> dict:
+def summarise(update: dict | Command | None) -> dict:
     """What a node changed, small enough to read in a log. Full state is in
-    the checkpoints; the log says what moved."""
+    the checkpoints; the log says what moved.
+
+    Day 52: a node may return a Command (an update plus where to go next)
+    instead of a plain dict. The update is summarised the same way, and
+    `goto` is recorded: for a worker, that's the handoff or the return to
+    the supervisor, on the record."""
+    if isinstance(update, Command):
+        return {**summarise(update.update), "goto": update.goto}
     if not update:
         return {"changed": []}
     out: dict = {"changed": sorted(update)}
@@ -162,6 +170,8 @@ def summarise(update: dict | None) -> dict:
         out["customer_id"] = update["customer"].get("customer_id")
     if update.get("rejected"):
         out["rejected"] = sorted(update["rejected"])
+    if "next" in update:  # Day 51: the supervisor's routing decision
+        out["next"] = update["next"]
     return out
 
 
@@ -169,6 +179,13 @@ def format_row(row: dict) -> str:
     """One audit row as one terminal line."""
     d = row["detail"]
     at = row["at"][11:23]  # time of day is enough on screen; the row has the full stamp
+    if row["kind"] == "escalation":
+        extra = f"  ({d['priority']}, customer {d['sentiment']}): {d['reason']}" if row["outcome"] == "transferred" else ""
+        return f"{at}  {row['thread_id']:<10} ESCALATE {row['outcome']:<13} {d['ticket_id']}{extra}"
+    if row["kind"] == "conflict":
+        return f"{at}  {row['thread_id']:<10} CONFLICT {row['outcome']:<13} {row['node']} wrote {d['field']}={json.dumps(d['value'], ensure_ascii=False)}  ({d['why']})"
+    if row["kind"] == "handoff":
+        return f"{at}  {row['thread_id']:<10} HANDOFF  {row['outcome']:<13} {d['from']} => {d['to']}  ({d['reason']})"
     if row["kind"] == "approval":
         who = d["by"] if d["by"] != "policy" else f"policy:{d['rule']}"
         extra = f"  reason: {d['reason']}" if d.get("reason") else ""
@@ -186,4 +203,8 @@ def format_row(row: dict) -> str:
         what = f"waiting for {d['waiting_for']}"
     elif "error" in d:
         what = d["error"]
+    elif "next" in d:
+        what = f"route -> {d['next']}"
+    elif "goto" in d:
+        what = f"-> {d['goto']}"
     return f"{at}  {row['thread_id']:<10} step {row['step']:>2}  {row['node']:<13} {row['outcome']:<9} {what}"

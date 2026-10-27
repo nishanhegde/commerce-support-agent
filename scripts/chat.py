@@ -30,6 +30,17 @@ with scripts/audit.py --thread <name>.
 Try: "return one pair of the Road Runner 2 from 1046"   (₹4,499: no prompt)
 Try: "return the jacket from 1043"                      (₹5,999: approval)
 
+Day 51: --supervisor runs the supervisor graph instead: it delegates to
+order_agent / returns_agent / general_agent and writes the reply itself.
+Workers' own steps stream indented under their name. Use a new --thread:
+a thread holds one graph's state, and the two graphs' states differ.
+
+Run: uv run python scripts/chat.py --supervisor --thread sup1
+Try: "my Trail Runner is a week late and I want my money back"
+
+Day 53: --shared (with --supervisor) gives every worker the conversation
+and the shared case file; their writes to it stream as "wrote to case".
+
 Run: uv run python scripts/chat.py --mcp --thread wismo
 Try: "I ordered running shoes in August and they still haven't arrived"
 """
@@ -41,6 +52,7 @@ from contextlib import ExitStack
 
 from dotenv import load_dotenv
 
+from support_agent import supervisor
 from support_agent.audit import AUDIT_PATH, AuditLog
 from support_agent.hitl import decision, pending_approval, render
 from support_agent.mcp_bridge import MCPBridge, mcp_commerce_server
@@ -91,17 +103,41 @@ def review(pending: list[dict]):
     return decision(False, input("reason> ").strip(), reviewer=reviewer)
 
 
-def run(graph, graph_input, config: dict, context: CustomerContext | None) -> None:
+def steps(graph, graph_input, config: dict, context, supervised: bool):
+    """(namespace, node, delta) for each streamed step.
+
+    Day 51: with subgraphs=True, stream() also yields steps from inside the
+    workers, as (namespace, update) pairs. The namespace is () for the
+    graph's own nodes and ("returns_agent:<id>",) inside a worker. Without
+    it, every step is the graph's own, so the namespace is always ().
+    """
+    if supervised:
+        for ns, update in graph.stream(graph_input, config, stream_mode="updates", context=context, subgraphs=True):
+            for node, delta in update.items():
+                yield ns, node, delta
+    else:
+        for update in graph.stream(graph_input, config, stream_mode="updates", context=context):
+            for node, delta in update.items():
+                yield (), node, delta
+
+
+def run(graph, graph_input, config: dict, context: CustomerContext | None, supervised: bool = False) -> None:
     """Stream one turn, stopping for approval as often as the agent asks.
 
     `context` goes into every stream() call, resumes too: it isn't saved in
     the checkpoint, so a resume without it would run with no customer.
     """
     while True:
-        for update in graph.stream(graph_input, config, stream_mode="updates", context=context):
-            for node, delta in update.items():
-                for line in render(node, delta):
-                    print(line)
+        for ns, node, delta in steps(graph, graph_input, config, context, supervised):
+            if not ns:
+                lines = supervisor.render(node, delta) if supervised else render(node, delta)
+            else:
+                # Inside a worker: its tool calls, indented under its name.
+                # Its final answer is skipped; the report line shows it.
+                worker = ns[0].split(":")[0]
+                lines = [f"    {worker} {line.strip()}" for line in render(node, delta) if not line.startswith("agent>")]
+            for line in lines:
+                print(line)
         pending = pending_approval(graph, config)
         if not pending:
             return
@@ -114,6 +150,8 @@ def main() -> None:
     parser.add_argument("--thread", default="demo")
     parser.add_argument("--mcp", action="store_true", help="use mcp-commerce's tools")
     parser.add_argument("--customer", default="C-100", help="signed-in customer (not with --mcp)")
+    parser.add_argument("--supervisor", action="store_true", help="Day 51 supervisor + workers (not with --mcp)")
+    parser.add_argument("--shared", action="store_true", help="Day 53: with --supervisor, workers share state")
     args = parser.parse_args()
     load_dotenv()
 
@@ -142,7 +180,12 @@ def main() -> None:
             # different data set; there the customer is the OCC user.
             store = stack.enter_context(sqlite_store())
             seed_profiles(store)
-            graph = build_explicit(checkpointer=saver, store=store, audit=audit)
+            if args.supervisor:
+                graph = supervisor.build_supervisor(checkpointer=saver, store=store, audit=audit, shared=args.shared)
+                print("supervisor: order_agent, returns_agent, general_agent"
+                      + ("  (shared state)" if args.shared else "  (isolated workers)"))
+            else:
+                graph = build_explicit(checkpointer=saver, store=store, audit=audit)
             context = CustomerContext(args.customer)
             print(f"customer={args.customer!r}  memory={STORE_PATH}")
         config = thread(args.thread)
@@ -156,14 +199,15 @@ def main() -> None:
             # a new user message can't go in while a tool_use is unanswered.
             if pending := pending_approval(graph, config):
                 print("this thread was paused waiting for approval")
-                run(graph, review(pending), config, context)
+                run(graph, review(pending), config, context, args.supervisor)
                 print()
 
             while True:
                 text = input("you> ").strip()
                 if not text:
                     break
-                run(graph, turn_input(text), config, context)
+                new_turn = supervisor.turn_input if args.supervisor else turn_input
+                run(graph, new_turn(text), config, context, args.supervisor)
                 print()
         except EOFError:
             pass
