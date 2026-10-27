@@ -6,6 +6,7 @@ dependencies = [
     "langchain-anthropic>=1.7.6",
     "langgraph>=1.2.15",
     "langgraph-checkpoint-sqlite>=3.1.2",
+    "mcp>=2.1.1",
     "python-dotenv>=1.2.4",
 ]
 

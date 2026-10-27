@@ -8,10 +8,15 @@ docstring — one object holds name, schema, description, and the callable.
 
 The data is in-memory on purpose. Week 10 swaps these for the `mcp-commerce`
 server; today the only new thing should be the graph.
+
+Day 47's return tools live in returns.py, over the same ORDERS.
 """
 
 from langchain_core.tools import tool
 
+# Day 47: each line carries its category and the price paid. The price is
+# copied onto the line at order time (OCC's entry basePrice), not looked up
+# from the catalogue: a refund is for what the customer paid, not today's price.
 ORDERS = {
     "1042": {
         "order_id": "1042",
@@ -19,7 +24,10 @@ ORDERS = {
         "carrier": "BlueDart",
         "tracking_number": "BD-99120384",
         "estimated_delivery": "2026-10-28",
-        "items": [{"sku": "RS-4471-BLK", "name": "Trail Runner 4", "qty": 1}],
+        "items": [
+            {"sku": "RS-4471-BLK", "name": "Trail Runner 4", "qty": 1,
+             "category": "footwear", "unit_price": 7999},
+        ],
     },
     "1043": {
         "order_id": "1043",
@@ -27,14 +35,59 @@ ORDERS = {
         "carrier": "Delhivery",
         "tracking_number": "DL-40028871",
         "delivered_on": "2026-10-20",
-        "items": [{"sku": "JK-2210-GRN", "name": "Stormline Jacket", "qty": 1}],
+        "items": [
+            {"sku": "JK-2210-GRN", "name": "Stormline Jacket", "qty": 1,
+             "category": "apparel", "unit_price": 5999},
+        ],
     },
     "1044": {
         "order_id": "1044",
         "status": "pending",
         "carrier": None,
         "tracking_number": None,
-        "items": [{"sku": "AC-0031-BLK", "name": "Cushion Insole", "qty": 2}],
+        "items": [
+            {"sku": "AC-0031-BLK", "name": "Cushion Insole", "qty": 2,
+             "category": "foot-care", "unit_price": 799},
+        ],
+    },
+    # Day 47: delivered orders that each hit a different return rule.
+    # Delivered well over 30 days ago: outside the standard window.
+    "1045": {
+        "order_id": "1045",
+        "status": "delivered",
+        "carrier": "BlueDart",
+        "tracking_number": "BD-99108812",
+        "delivered_on": "2026-09-10",
+        "items": [
+            {"sku": "RS-3020-BLU", "name": "Road Runner 2", "qty": 1,
+             "category": "footwear", "unit_price": 4499},
+        ],
+    },
+    # A mixed basket: the shoes can go back, the insoles can't.
+    "1046": {
+        "order_id": "1046",
+        "status": "delivered",
+        "carrier": "Delhivery",
+        "tracking_number": "DL-40031190",
+        "delivered_on": "2026-10-22",
+        "items": [
+            {"sku": "RS-3020-BLU", "name": "Road Runner 2", "qty": 2,
+             "category": "footwear", "unit_price": 4499},
+            {"sku": "AC-0031-BLK", "name": "Cushion Insole", "qty": 1,
+             "category": "foot-care", "unit_price": 799},
+        ],
+    },
+    # Inside 30 days, but electronics get 10.
+    "1047": {
+        "order_id": "1047",
+        "status": "delivered",
+        "carrier": "BlueDart",
+        "tracking_number": "BD-99117735",
+        "delivered_on": "2026-10-12",
+        "items": [
+            {"sku": "EL-0900-BLK", "name": "Pulse GPS Watch", "qty": 1,
+             "category": "electronics", "unit_price": 12999},
+        ],
     },
 }
 
@@ -43,6 +96,7 @@ PRODUCTS = [
     {"sku": "RS-3020-BLU", "name": "Road Runner 2", "price": 4499, "in_stock": True},
     {"sku": "JK-2210-GRN", "name": "Stormline Jacket", "price": 5999, "in_stock": False},
     {"sku": "AC-0031-BLK", "name": "Cushion Insole", "price": 799, "in_stock": True},
+    {"sku": "EL-0900-BLK", "name": "Pulse GPS Watch", "price": 12999, "in_stock": True},
 ]
 
 
@@ -117,4 +171,6 @@ TOOLS = [get_order_status, search_products, cancel_order]
 
 # Tools the graph will not run without a human saying yes (Day 44). A set of
 # names, not a flag on the tool, so the policy lives in one place you can read.
-NEEDS_APPROVAL = {"cancel_order"}
+# Day 47: create_return (returns.py) joins it. Day 49 narrows that to refunds
+# over a threshold.
+NEEDS_APPROVAL = {"cancel_order", "create_return"}

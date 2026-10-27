@@ -25,7 +25,7 @@ Two stopping mechanisms, and they are different things:
     wrong.
 
 Day 44 adds one node, `approve`, between `agent` and `tools`, reached only
-when the model asks for a tool in NEEDS_APPROVAL:
+when the model asks for a tool in `needs_approval`:
 
     agent -> approve -> tools -> agent      (cancel: pause for a human first)
     agent -> tools -> agent                 (lookups: unchanged)
@@ -37,13 +37,14 @@ from typing import Literal
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
-from langchain_core.tools import ToolException
+from langchain_core.tools import BaseTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
+from support_agent.returns import RETURN_TOOLS
 from support_agent.tools import NEEDS_APPROVAL, TOOLS
 
 MODEL = "claude-opus-5"
@@ -52,9 +53,16 @@ SYSTEM = """You are a commerce support agent for an online retailer.
 
 Use your tools to look up facts before answering. Never guess at stock,
 prices, or order status. When a question needs several independent lookups,
-request them together rather than one at a time. Be brief and concrete."""
+request them together rather than one at a time. Be brief and concrete.
 
-TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+For a return: check eligibility first and tell the customer the answer and
+the reasons. Create the return only once they confirm. If the customer asks
+for a person or disputes a policy answer, escalate to a human and give them
+the ticket id."""
+
+# Day 47: the graph's default tools are the order tools plus the return
+# tools. The prebuilt agent keeps the order tools: it's there for comparison.
+DEFAULT_TOOLS = [*TOOLS, *RETURN_TOOLS]
 
 
 def default_model() -> BaseChatModel:
@@ -100,18 +108,25 @@ def build_explicit(
     model: BaseChatModel | None = None,
     max_iterations: int = 6,
     checkpointer: BaseCheckpointSaver | None = None,
+    # Day 46: the graph no longer owns its tools. The defaults are the
+    # in-memory ones; mcp_bridge supplies mcp-commerce's, with an approval
+    # set taken from the server's annotations.
+    tools: list[BaseTool] = DEFAULT_TOOLS,
+    needs_approval: set[str] = NEEDS_APPROVAL,
+    system: str = SYSTEM,
 ):
     # bind_tools attaches the tool schemas to every request, like passing
     # `tools=TOOLS` to client.messages.create in Month 1.
-    llm = (model or default_model()).bind_tools(TOOLS)
+    llm = (model or default_model()).bind_tools(tools)
+    tools_by_name = {t.name: t for t in tools}
 
     def agent(state: AgentState) -> dict:
         # The system prompt is prepended per call rather than stored in state,
         # so it never gets duplicated into the history.
-        response = llm.invoke([SystemMessage(SYSTEM), *state["messages"]])
+        response = llm.invoke([SystemMessage(system), *state["messages"]])
         return {"messages": [response], "iterations": state.get("iterations", 0) + 1}
 
-    def tools(state: AgentState) -> dict:
+    def run_tools(state: AgentState) -> dict:
         # Month 1's execute(), per tool call. Errors become ToolMessages with
         # status="error" (sent to Claude as is_error: True) so the model can
         # adapt, instead of an exception killing the run.
@@ -121,7 +136,7 @@ def build_explicit(
         rejected = state.get("rejected", {})
         results = []
         for call in last.tool_calls:
-            tool = TOOLS_BY_NAME.get(call["name"])
+            tool = tools_by_name.get(call["name"])
             if call["id"] in rejected:
                 # Every tool_use still needs a tool_result, or the next API
                 # call is invalid. A rejection is that result: the model
@@ -139,7 +154,9 @@ def build_explicit(
                     content, status = {"error": f"{call['name']} failed: {e}"}, "error"
             results.append(
                 ToolMessage(
-                    json.dumps(content),
+                    # MCP tools return text that is already JSON; dumping it
+                    # again would send Claude a quoted, escaped string.
+                    content if isinstance(content, str) else json.dumps(content),
                     tool_call_id=call["id"],
                     name=call["name"],
                     status=status,
@@ -164,7 +181,7 @@ def build_explicit(
         # than an interrupt() inside `tools`, where a read-only tool batched
         # alongside the cancel would run once before the pause and again after.
         last: AIMessage = state["messages"][-1]
-        pending = [c for c in last.tool_calls if c["name"] in NEEDS_APPROVAL]
+        pending = [c for c in last.tool_calls if c["name"] in needs_approval]
         decision = interrupt({"tool_calls": pending})
         # One decision covers every gated call in this turn. Per-call
         # decisions would be the same shape with a list.
@@ -189,7 +206,7 @@ def build_explicit(
             return END
         # Day 44: only turns that touch a gated tool stop for a human. Lookups
         # go straight through.
-        return "approve" if any(c["name"] in NEEDS_APPROVAL for c in calls) else "tools"
+        return "approve" if any(c["name"] in needs_approval for c in calls) else "tools"
 
     def route_after_tools(state: AgentState) -> Literal["agent", "give_up"]:
         # The guard sits *before* the next model call, as in Month 1, so a
@@ -198,7 +215,7 @@ def build_explicit(
 
     g = StateGraph(AgentState)
     g.add_node("agent", agent)
-    g.add_node("tools", tools)
+    g.add_node("tools", run_tools)
     g.add_node("approve", approve)
     g.add_node("give_up", give_up)
     g.add_edge(START, "agent")
