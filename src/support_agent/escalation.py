@@ -81,6 +81,16 @@ def summarise(model: BaseChatModel, transcript: list[str], facts: str) -> Handof
     )
 
 
+def unavailable_summary() -> HandoffSummary:
+    """Stands in when the summary model can't be reached. Says so, in the
+    field the human reads first, and sends them to the record."""
+    return HandoffSummary(
+        issue="(AI summary unavailable: the model could not be reached. Read the record and transcript below.)",
+        customer_wants="see transcript", sentiment="frustrated", already_done=[],
+        suggested_next_step="read the transcript and the actions on record",
+    )
+
+
 def transcript_lines(messages: list) -> list[str]:
     return [f"{'customer' if m.type == 'human' else 'agent'}: {message_text(m)}" for m in messages]
 

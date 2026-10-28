@@ -67,6 +67,7 @@ from support_agent.persistence import (
     turn_input,
 )
 from support_agent.react import build_explicit
+from support_agent.tracing import RunTrace, format_summary
 
 # Month 2's demo prompt (mcp-commerce/examples/demo.py), trimmed. Day 50:
 # the graph now appends today's date to every system prompt, so it's no
@@ -188,7 +189,10 @@ def main() -> None:
                 graph = build_explicit(checkpointer=saver, store=store, audit=audit)
             context = CustomerContext(args.customer)
             print(f"customer={args.customer!r}  memory={STORE_PATH}")
-        config = thread(args.thread)
+        # Day 57: every model call, node and tool call of this session goes to
+        # data/runs/<thread>.jsonl, and the totals print when you quit.
+        trace = RunTrace(args.thread, path=AUDIT_PATH.parent / "runs" / f"{args.thread}.jsonl")
+        config = thread(args.thread, trace)
         prior = graph.get_state(config).values.get("messages", [])
         print(f"thread={args.thread!r}  db={DB_PATH}")
         print(f"resuming with {len(prior)} messages" if prior else "new conversation")
@@ -211,6 +215,7 @@ def main() -> None:
                 print()
         except EOFError:
             pass
+        print("\n" + format_summary(trace.summary()))
 
 
 if __name__ == "__main__":

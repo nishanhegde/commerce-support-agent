@@ -43,6 +43,7 @@ from typing import Literal
 
 from langchain_core.tools import tool
 
+from support_agent.resilience import mark_read_only
 from support_agent.tools import ORDERS
 
 DEFAULT_WINDOW_DAYS = 30
@@ -251,3 +252,5 @@ def escalate_to_human(summary: str, reason: str, priority: Literal["normal", "ur
 
 
 RETURN_TOOLS = [check_return_eligibility, create_return, escalate_to_human]
+
+mark_read_only(check_return_eligibility)

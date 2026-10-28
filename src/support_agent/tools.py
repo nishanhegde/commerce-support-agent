@@ -14,6 +14,8 @@ Day 47's return tools live in returns.py, over the same ORDERS.
 
 from langchain_core.tools import tool
 
+from support_agent.resilience import mark_read_only
+
 # Day 47: each line carries its category and the price paid. The price is
 # copied onto the line at order time (OCC's entry basePrice), not looked up
 # from the catalogue: a refund is for what the customer paid, not today's price.
@@ -181,6 +183,9 @@ def cancel_order(order_id: str, reason: str) -> dict:
 
 
 TOOLS = [get_order_status, search_products, cancel_order]
+
+# Day 56: the lookups are safe to repeat, so a failed call is retried.
+mark_read_only(get_order_status, search_products)
 
 # Which of these need a human's approval lived here as a set of names from
 # Day 44. Day 49 moved it to policy.py, where it can depend on the arguments.

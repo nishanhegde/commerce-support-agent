@@ -79,6 +79,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.config import get_config
+from langgraph.errors import NodeError
 from langgraph.store.base import BaseStore
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -95,11 +96,13 @@ from support_agent.escalation import (
     package,
     summarise,
     transcript_lines,
+    unavailable_summary,
     transfer,
     transferred_reply,
 )
 from support_agent.memory import CustomerContext, customer_prompt, load_customer, save_customer_note
 from support_agent.policy import Policy, default_policy
+from support_agent.resilience import APOLOGY, Resilience, is_transient, retry_call
 from support_agent.react import build_explicit, default_model, message_text
 from support_agent.returns import check_return_eligibility, create_return
 from support_agent.tools import cancel_order, get_order_status, search_products
@@ -263,6 +266,8 @@ def build_supervisor(
     shared: bool = False,
     summary_model: BaseChatModel | None = None,
     handoff_dir: Path | None = HANDOFF_DIR,
+    # Day 56: the router and the workers fail the way any model call does.
+    resilience: Resilience = Resilience(),
 ):
     """`model` routes and replies; `worker_models` overrides a worker's model
     by name (tests script each one). Every model defaults to default_model().
@@ -271,6 +276,8 @@ def build_supervisor(
     audit = audit or AuditLog()
     worker_models = worker_models or {}
     router = (model or default_model()).bind_tools([Route], tool_choice="Route")
+    fallback = resilience.fallback_model
+    fallback_router = fallback.bind_tools([Route], tool_choice="Route") if fallback else None
     summariser = summary_model or model or default_model()
 
     workers = {
@@ -290,6 +297,7 @@ def build_supervisor(
             ),
             audit=audit,
             name=name,
+            resilience=resilience,
             stop_after=frozenset(f"{TRANSFER_PREFIX}{t}" for t in HANDOFFS.get(name, [])),
             # No checkpointer: a worker called inside a node inherits this
             # graph's, so its interrupts pause and resume with the parent.
@@ -299,7 +307,7 @@ def build_supervisor(
     }
     roster = "\n".join(f"- {name}: {job}" for name, (_, job) in WORKERS.items())
 
-    def supervisor(state: SupervisorState) -> dict:
+    def decide(router_model, state: SupervisorState) -> dict:
         used = state.get("delegations", 0)
         prompt = (
             SUPERVISOR_SYSTEM.format(workers=roster)
@@ -310,7 +318,7 @@ def build_supervisor(
         )
         if used >= max_delegations:
             prompt += f"\n\nYou have used all {max_delegations} delegations for this turn: FINISH now."
-        response = router.invoke([SystemMessage(prompt), *state["messages"]])
+        response = router_model.invoke([SystemMessage(prompt), *state["messages"]])
         route = _parse(response)
 
         if route.next != "FINISH" and used >= max_delegations:
@@ -322,6 +330,24 @@ def build_supervisor(
         if route.next == "ESCALATE":
             return {"next": "ESCALATE", "task": route.task, "priority": route.priority}
         return {"next": route.next, "task": route.task, "delegations": used + 1}
+
+    def supervisor(state: SupervisorState) -> dict:
+        return decide(router, state)
+
+    def recover_supervisor(state: SupervisorState, error: NodeError) -> Command:
+        # Day 56: the router's retries are used up (RetryPolicy, below). Same
+        # shape as react.py's `recover`: the fallback model once, then a
+        # reply the customer can read instead of an exception.
+        if fallback_router is not None and is_transient(error.error):
+            try:
+                update = decide(fallback_router, state)
+            except Exception as e:
+                audit.record("recovery", "fallback_failed", node="supervisor", error=repr(e))
+            else:
+                audit.record("recovery", "fell_back", node="supervisor", error=repr(error.error))
+                return Command(update=update, goto=route_after_supervisor({**state, **update}))
+        audit.record("recovery", "gave_up", node="supervisor", error=repr(error.error))
+        return Command(update={"next": "FINISH", "messages": [AIMessage(APOLOGY)]}, goto=END)
 
     def worker_node(name: str):
         graph = workers[name]
@@ -406,7 +432,16 @@ def build_supervisor(
             "## Actions on record\n" + ("\n".join(f"- {a}" for a in actions) or "none"),
             _reports_block(state.get("reports", [])).strip(),
         ]))
-        summary = summarise(summariser, transcript, facts)
+        # Day 56: a handover without the AI summary beats no handover. The
+        # facts under it (actions, transcript) don't need the model.
+        try:
+            summary = retry_call(
+                lambda: summarise(summariser, transcript, facts),
+                attempts=resilience.model_attempts, base_delay=resilience.base_delay,
+            )
+        except Exception as e:
+            audit.record("recovery", "summary_unavailable", node="escalate", error=repr(e))
+            summary = unavailable_summary()
         ticket_id = next_ticket_id()
         doc = package(ticket_id, state["task"], state.get("priority", "normal"), state.get("customer"),
                       summary, state.get("case"), actions, transcript)
@@ -437,10 +472,10 @@ def build_supervisor(
 
     g = StateGraph(SupervisorState, context_schema=CustomerContext)
 
-    def add(node: str, fn) -> None:
-        g.add_node(node, audited(node, fn, audit))
+    def add(node: str, fn, **kwargs) -> None:
+        g.add_node(node, audited(node, fn, audit), **kwargs)
 
-    add("supervisor", supervisor)
+    add("supervisor", supervisor, retry_policy=resilience.node_retry(), error_handler=recover_supervisor)
     for name in WORKERS:
         # Day 52: no static edge out of a worker; its Command says where to
         # go. `destinations` only tells the graph drawing which arrows exist.

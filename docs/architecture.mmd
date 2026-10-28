@@ -1,0 +1,41 @@
+flowchart TD
+    customer([Customer]) --> start{"thread state?"}
+    start -->|first turn| load["load_customer<br/>profile + notes from the Store"]
+    start -->|escalated| human["with_human<br/>message goes on the ticket,<br/>no model call"]
+    start -->|otherwise| sup
+    load --> sup
+
+    subgraph SG["Supervisor graph (supervisor.py)"]
+        sup["supervisor<br/>one forced Route call per step<br/>retry, fallback model, apology"]
+        sup -->|delegate| OA["order_agent"]
+        sup -->|delegate| RA["returns_agent"]
+        sup -->|delegate| GA["general_agent"]
+        OA <-.->|handoff| RA
+        OA -->|report| sup
+        RA -->|report| sup
+        GA -->|report| sup
+        sup -->|ESCALATE| esc["escalate<br/>summarise, package, transfer"]
+    end
+    sup -->|FINISH| reply([Reply to customer])
+    esc --> ticket[("data/handoffs/HO-0001.md + .json<br/>summary labelled AI-generated<br/>facts copied from the audit log")]
+    esc --> reply
+
+    subgraph WK["Inside every worker (react.py): a ReAct subgraph"]
+        agent["agent<br/>RetryPolicy on transient errors"] -->|tool calls| gate{"policy.py<br/>needs a human?"}
+        gate -->|yes| approve["approve<br/>interrupt() for a reviewer"]
+        gate -->|no| tools
+        approve --> tools["tools<br/>per-call retry, reads only"]
+        tools --> agent
+        agent -.->|retries exhausted| recover["recover<br/>fallback model, else apology;<br/>every tool_use gets a result"]
+    end
+    OA & RA & GA -.- WK
+
+    tools --> mcp["MCPBridge (mcp_bridge.py)<br/>sync wrapper, timeouts,<br/>dead server = ToolUnavailable"]
+    mcp --> server[("mcp-commerce<br/>stdio subprocess, OCC mock")]
+
+    audit[("audit.sqlite<br/>every node, approval, handoff,<br/>recovery, escalation")]
+    trace[("data/runs/&lt;thread&gt;.jsonl<br/>tokens, latency, cost<br/>per node, model call, tool")]
+    ckpt[("checkpoints.sqlite<br/>resume, fork, replay")]
+    SG -.-> audit
+    SG -.-> trace
+    SG -.-> ckpt

@@ -27,6 +27,7 @@ same loop, and the session handles them concurrently.
 """
 
 import asyncio
+import concurrent.futures
 import os
 import threading
 from pathlib import Path
@@ -34,7 +35,10 @@ from pathlib import Path
 from langchain_core.tools import StructuredTool, ToolException
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import get_default_environment, stdio_client
-from mcp.types import Tool
+from mcp.shared.exceptions import MCPError
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, Tool
+
+from support_agent.resilience import ToolUnavailable, mark_read_only
 
 # The Month 2 repo, a sibling of this one. MCP_COMMERCE_DIR overrides it.
 DEFAULT_SERVER_DIR = Path(__file__).resolve().parents[3] / "mcp-commerce"
@@ -65,9 +69,15 @@ class MCPBridge:
             graph = build_explicit(tools=bridge.tools, policy=by_name(bridge.needs_approval))
     """
 
-    def __init__(self, server: StdioServerParameters, errlog_path: Path | None = None):
+    def __init__(
+        self,
+        server: StdioServerParameters,
+        errlog_path: Path | None = None,
+        call_timeout: float = CALL_TIMEOUT,
+    ):
         self._server = server
         self._errlog_path = errlog_path
+        self._call_timeout = call_timeout
         self._loop = asyncio.new_event_loop()
         # daemon=True: if something goes wrong and __exit__ never runs, the
         # thread won't keep the process alive at exit.
@@ -132,11 +142,28 @@ class MCPBridge:
     def call(self, name: str, args: dict) -> str:
         """Call one MCP tool and block until it answers. Returns its text.
 
-        An MCP error result (is_error) becomes ToolException, which the graph's
-        tools node already turns into a ToolMessage with status="error".
+        Three ways it can end, kept apart because the graph reacts differently:
+          - the tool ran and refused (is_error): ToolException, an answer
+          - the server can't be reached: ToolUnavailable, the lack of one
+          - anything else (a bug, a bad request): propagates as it is
         """
-        coro = self._session.call_tool(name, args)
-        result = asyncio.run_coroutine_threadsafe(coro, self._loop).result(CALL_TIMEOUT)
+        future = asyncio.run_coroutine_threadsafe(self._session.call_tool(name, args), self._loop)
+        try:
+            result = future.result(self._call_timeout)
+        except concurrent.futures.TimeoutError:
+            # .result() gave up waiting, but the call is still running on the
+            # loop. Cancel it, or a slow answer arrives later with no one
+            # waiting for it.
+            future.cancel()
+            raise ToolUnavailable(f"{name} gave no answer in {self._call_timeout:g}s") from None
+        except MCPError as e:
+            # The server process is gone (killed, crashed, closed its stdout):
+            # the client reports it as an error response with a reserved
+            # code, in no time, not as a hang. The server stays down: there
+            # is no reconnect, so every later call fails the same way, fast.
+            if e.code in (CONNECTION_CLOSED, REQUEST_TIMEOUT):
+                raise ToolUnavailable(f"mcp-commerce: {e.message}") from e
+            raise
         text = "".join(c.text for c in result.content if c.type == "text")
         if result.is_error:
             raise ToolException(text)
@@ -155,9 +182,13 @@ class MCPBridge:
         def call(**kwargs) -> str:
             return self.call(tool.name, kwargs)
 
-        return StructuredTool(
+        built = StructuredTool(
             name=tool.name,
             description=tool.description or "",
             args_schema=tool.input_schema,
             func=call,
         )
+        # Day 56: the server's own word on which tools are safe to repeat.
+        if tool.annotations and tool.annotations.read_only_hint:
+            mark_read_only(built)
+        return built

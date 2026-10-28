@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from support_agent.audit import format_row
 from support_agent.e2e import TURNS, judge, run_scenario
+from support_agent.tracing import RunTrace, format_summary
 
 
 def main() -> None:
@@ -20,13 +21,16 @@ def main() -> None:
     args = parser.parse_args()
     load_dotenv()
 
-    run = run_scenario(approve=not args.reject)
+    trace = RunTrace("e2e")
+    run = run_scenario(approve=not args.reject, trace=trace)
 
     for text, reply in zip(TURNS, run.replies):
         print(f"customer> {text}\n\nagent> {reply}\n")
     print("--- audit trail")
     for row in run.audit_rows:
         print(format_row(row))
+    print("\n--- cost and latency")
+    print(format_summary(trace.summary()))
     print("\n--- stages")
     results = judge(run, approved=not args.reject)
     for stage, ok, evidence in results:

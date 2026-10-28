@@ -1,6 +1,135 @@
 # commerce-support-agent
 
-Month 3: LangGraph customer-support agent over the `mcp-commerce` tool layer.
+A customer-support agent for a commerce store, built in LangGraph over the
+[`mcp-commerce`](../mcp-commerce) MCP server (Month 2). A supervisor routes
+each message to order, returns and general workers; refunds over ₹5,000 stop
+for a human; hard cases are handed to a person with a briefing document; and
+every step is audited, traced and recoverable.
+
+The question the project answers: **when is multi-agent worth it?** For this
+agent, it isn't, and the section below shows how that was worked out.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    customer([Customer]) --> start{"thread state?"}
+    start -->|first turn| load["load_customer<br/>profile + notes from the Store"]
+    start -->|escalated| human["with_human<br/>message goes on the ticket,<br/>no model call"]
+    start -->|otherwise| sup
+    load --> sup
+
+    subgraph SG["Supervisor graph (supervisor.py)"]
+        sup["supervisor<br/>one forced Route call per step<br/>retry, fallback model, apology"]
+        sup -->|delegate| OA["order_agent"]
+        sup -->|delegate| RA["returns_agent"]
+        sup -->|delegate| GA["general_agent"]
+        OA <-.->|handoff| RA
+        OA -->|report| sup
+        RA -->|report| sup
+        GA -->|report| sup
+        sup -->|ESCALATE| esc["escalate<br/>summarise, package, transfer"]
+    end
+    sup -->|FINISH| reply([Reply to customer])
+    esc --> ticket[("data/handoffs/HO-0001.md + .json<br/>summary labelled AI-generated<br/>facts copied from the audit log")]
+    esc --> reply
+
+    subgraph WK["Inside every worker (react.py): a ReAct subgraph"]
+        agent["agent<br/>RetryPolicy on transient errors"] -->|tool calls| gate{"policy.py<br/>needs a human?"}
+        gate -->|yes| approve["approve<br/>interrupt() for a reviewer"]
+        gate -->|no| tools
+        approve --> tools["tools<br/>per-call retry, reads only"]
+        tools --> agent
+        agent -.->|retries exhausted| recover["recover<br/>fallback model, else apology;<br/>every tool_use gets a result"]
+    end
+    OA & RA & GA -.- WK
+
+    tools --> mcp["MCPBridge (mcp_bridge.py)<br/>sync wrapper, timeouts,<br/>dead server = ToolUnavailable"]
+    mcp --> server[("mcp-commerce<br/>stdio subprocess, OCC mock")]
+
+    audit[("audit.sqlite<br/>every node, approval, handoff,<br/>recovery, escalation")]
+    trace[("data/runs/&lt;thread&gt;.jsonl<br/>tokens, latency, cost<br/>per node, model call, tool")]
+    ckpt[("checkpoints.sqlite<br/>resume, fork, replay")]
+    SG -.-> audit
+    SG -.-> trace
+    SG -.-> ckpt
+```
+
+Source: [`docs/architecture.mmd`](docs/architecture.mmd). Where things are:
+
+| Concern | Code | What it does |
+|---|---|---|
+| The agent loop | `react.py` | ReAct as an explicit graph: `agent`, `approve`, `tools`, `give_up` |
+| Multi-agent | `supervisor.py`, `case.py` | supervisor, workers, handoffs, shared case file |
+| Human in the loop | `policy.py`, `hitl.py` | approval rules as code, per call and per argument; `interrupt()` pause and resume |
+| Memory | `persistence.py`, `memory.py` | SQLite checkpoints (a conversation survives a restart), long-term customer notes in a Store |
+| Tools | `mcp_bridge.py` | the async MCP client behind a sync tool interface, on its own event-loop thread |
+| Escalation | `escalation.py` | summarise, package, transfer; the bot stops answering |
+| Audit | `audit.py` | append-only: who allowed what, under which rule |
+| Resilience | `resilience.py` | retries, fallback model, recovery path (below) |
+| Tracing | `tracing.py` | tokens, latency and cost per conversation (below) |
+
+## Run it
+
+```bash
+uv sync
+echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
+uv run python scripts/chat.py --supervisor --customer C-100 --thread demo
+uv run python scripts/chat.py --mcp --thread wismo   # against the mcp-commerce server
+uv run python scripts/audit.py --thread demo         # who did what, and who approved it
+uv run pytest                                         # offline: no API calls, 200+ tests
+```
+
+The demo flow is in [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md).
+
+## What was verified, and how
+
+- **Live against Claude:** Days 41-50, including the end-to-end scenario
+  (`failures.md`: six failures found, five fixed and re-run).
+- **Offline only:** everything from Day 51 on (supervisor, handoffs, shared
+  state, escalation, resilience, tracing). The API credit ran out. The
+  scripted-model tests exercise the graph, policy, audit log and recovery
+  paths for real; what they can't tell you is how Claude behaves inside
+  them. Two things are owed against the live API: `scripts/e2e.py --reject`,
+  and the cost and latency comparison between the designs (the numbers
+  below for the multi-agent versions are counted from the graph, not measured).
+
+## When something breaks (Day 56)
+
+| Failure | What happens | Where |
+|---|---|---|
+| Model call fails (connection, 429, 5xx) | retried 3x with backoff by the node's `RetryPolicy`; then a fallback model if configured; then a plain apology | `react.py`, `supervisor.py` |
+| A read tool can't be reached | retried once, per call | `react.py` |
+| **A write tool can't be reached** | **never retried**: no answer doesn't mean it didn't happen. The model is told the system isn't responding, and not to guess | `resilience.py` |
+| MCP server killed or hung | `ToolUnavailable`, immediately; the conversation carries on | `mcp_bridge.py`, `tests/test_chaos.py` |
+| A node crashes unexpectedly | `error_handler` ends the run with an apology and gives every pending `tool_use` a result, so the next API call isn't a 400 and the thread isn't bricked | `react.py` |
+| The summary model is down during an escalation | the handover goes ahead, with the facts and a note that the AI summary is missing | `supervisor.py` |
+
+Why the retries sit where they do: a retry policy on the `tools` node would
+re-run the whole batch of calls, repeating a write that already succeeded.
+So tool retries are per call, inside the node, and only for tools marked
+read-only (from the MCP server's own `readOnlyHint`). Timeouts are per call
+too: LangGraph's node `timeout` only works on async nodes, and this graph
+is sync.
+
+## Seeing what a conversation cost (Day 57)
+
+`scripts/chat.py` writes every node, model call and tool call to
+`data/runs/<thread>.jsonl` and prints a summary on exit:
+
+```
+thread t
+  model   2 calls (0 failed)  2000 in / 100 out tokens  $0.0053  0.0s
+  tools   1 calls (0 failed)  0.00s
+  node    agent                    2 runs    0.00s
+  node    tools                    1 runs    0.00s
+```
+
+(That is the format, from a scripted run with made-up usage numbers: no live run has been traced yet.)
+It's a callback handler passed through the graph config, so workers inside
+the supervisor are traced with no change to any node. Cached tokens are
+priced at the cache rate, and a model without a price is counted as
+"unpriced" instead of guessed.
 
 ## Single agent, supervisor, handoffs, shared state: when is multi-agent worth it?
 

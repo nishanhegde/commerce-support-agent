@@ -36,6 +36,7 @@ from support_agent.memory import CustomerContext, seed_profiles
 from support_agent.persistence import thread, turn_input
 from support_agent.react import build_explicit, message_text
 from support_agent.returns import RETURNS
+from support_agent.tracing import RunTrace
 
 CUSTOMER = CustomerContext("C-100")
 ORDER_ID = "1048"
@@ -58,14 +59,16 @@ class Run:
     audit_rows: list[dict] = field(default_factory=list)
 
 
-def run_scenario(model: BaseChatModel | None = None, approve: bool = True, audit: AuditLog | None = None) -> Run:
+def run_scenario(
+    model: BaseChatModel | None = None, approve: bool = True, audit: AuditLog | None = None, trace: RunTrace | None = None
+) -> Run:
     """Play TURNS against a fresh graph. Fresh means in-memory checkpoints,
     Store and audit log, so a run never sees an earlier run's state."""
     store = InMemoryStore()
     seed_profiles(store)
     audit = audit or AuditLog()
     graph = build_explicit(model, checkpointer=InMemorySaver(), store=store, audit=audit)
-    config = thread("e2e")
+    config = thread("e2e", *([trace] if trace else []))
     run = Run()
 
     for text in TURNS:

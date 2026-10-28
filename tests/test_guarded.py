@@ -208,7 +208,9 @@ def test_threads_are_kept_apart(audit):
     assert len(audit.rows("a")) == len(audit.rows("b")) == 1
 
 
-def test_a_failing_node_is_logged_before_the_error_propagates(audit):
+def test_a_failing_node_is_logged_and_then_recovered_from(audit):
+    # Day 56: this used to assert the RuntimeError escaped graph.invoke().
+    # Now the node's error_handler ends the run; the failure is still logged.
     @tool
     def flaky(order_id: str) -> dict:
         """Always breaks."""
@@ -220,12 +222,12 @@ def test_a_failing_node_is_logged_before_the_error_propagates(audit):
         tools=[flaky],
         audit=audit,
     )
-    with pytest.raises(RuntimeError):
-        graph.invoke(turn_input("x"), thread("t"))
+    graph.invoke(turn_input("x"), thread("t"))
 
-    *_, last = audit.rows("t", "transition")
-    assert (last["node"], last["outcome"]) == ("tools", "failed")
-    assert "database is down" in last["detail"]["error"]
+    failed = [r for r in audit.rows("t", "transition") if r["outcome"] == "failed"]
+    assert [r["node"] for r in failed] == ["tools"]
+    assert "database is down" in failed[0]["detail"]["error"]
+    assert [r["outcome"] for r in audit.rows("t", "recovery")] == ["gave_up"]
 
 
 def test_audit_file_survives_a_restart(tmp_path):

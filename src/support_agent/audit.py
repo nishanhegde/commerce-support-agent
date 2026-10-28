@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS audit (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     at        TEXT NOT NULL,
     thread_id TEXT NOT NULL,
-    kind      TEXT NOT NULL,   -- 'transition' | 'approval' | 'handoff' (Day 52) | 'conflict' (Day 53) | 'escalation' (Day 54)
+    kind      TEXT NOT NULL,   -- 'transition' | 'approval' | 'handoff' (Day 52) | 'conflict' (Day 53) | 'escalation' (Day 54) | 'recovery' (Day 56)
     step      INTEGER,
     node      TEXT,
     outcome   TEXT NOT NULL,   -- completed/paused/failed | auto_approved/approved/rejected
@@ -182,6 +182,9 @@ def format_row(row: dict) -> str:
     if row["kind"] == "escalation":
         extra = f"  ({d['priority']}, customer {d['sentiment']}): {d['reason']}" if row["outcome"] == "transferred" else ""
         return f"{at}  {row['thread_id']:<10} ESCALATE {row['outcome']:<13} {d['ticket_id']}{extra}"
+    if row["kind"] == "recovery":
+        what = d.get("tool", "") + (f" (attempt {d['attempt']})" if "attempt" in d else "")
+        return f"{at}  {row['thread_id']:<10} RECOVERY {row['outcome']:<13} {row['node']} {what}  {d['error']}"
     if row["kind"] == "conflict":
         return f"{at}  {row['thread_id']:<10} CONFLICT {row['outcome']:<13} {row['node']} wrote {d['field']}={json.dumps(d['value'], ensure_ascii=False)}  ({d['why']})"
     if row["kind"] == "handoff":

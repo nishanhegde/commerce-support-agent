@@ -56,9 +56,16 @@ def sqlite_store(path: Path = STORE_PATH) -> Iterator[SqliteStore]:
         yield store
 
 
-def thread(thread_id: str) -> dict:
-    """The config that selects a conversation. Every call on a thread needs it."""
-    return {"configurable": {"thread_id": thread_id}}
+def thread(thread_id: str, *callbacks) -> dict:
+    """The config that selects a conversation. Every call on a thread needs it.
+
+    Day 57: callbacks (a tracing.RunTrace) ride along in the config, which is
+    how LangChain hands them to every node, model call and tool call under it.
+    """
+    config: dict = {"configurable": {"thread_id": thread_id}}
+    if callbacks:
+        config["callbacks"] = list(callbacks)
+    return config
 
 
 def turn_input(text: str) -> dict:

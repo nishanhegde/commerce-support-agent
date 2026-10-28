@@ -39,6 +39,12 @@ the graph has a Store (memory.py):
 Day 49 changes no edges. Who goes through `approve` is now decided by a
 policy function (policy.py) instead of a set of names, and every node runs
 inside `audited` (audit.py), which logs each transition.
+
+Day 56 adds no edges either. A failing node is retried (RetryPolicy on
+`agent`, per-call retry of read-only tools inside `tools`), and when that is
+exhausted the node's error_handler (`recover`) ends the run with a reply the
+customer can read, or hands the model call to a fallback model. See
+resilience.py.
 """
 
 import json
@@ -49,16 +55,20 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, ToolException
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import NodeError
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.base import BaseStore
 from langgraph.prebuilt import create_react_agent
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from support_agent.audit import AuditLog, audited
 from support_agent.memory import CustomerContext, customer_prompt, load_customer, save_customer_note
 from support_agent import returns
 from support_agent.policy import Policy, default_policy
+from support_agent.resilience import (
+    Resilience, ToolUnavailable, is_read_only, is_transient, recovery_messages, retry_call,
+)
 from support_agent.returns import RETURN_TOOLS
 from support_agent.tools import TOOLS
 
@@ -84,7 +94,12 @@ DEFAULT_TOOLS = [*TOOLS, *RETURN_TOOLS, save_customer_note]
 
 
 def default_model() -> BaseChatModel:
-    return ChatAnthropic(model=MODEL, max_tokens=2048)
+    # Day 56: both off the SDK's defaults, so the failure policy is in one
+    # place. The SDK retries 2x on its own (max_retries=2) and waits up to 10
+    # minutes (timeout=600), and LangGraph's RetryPolicy on top would multiply
+    # that: 3 x 3 attempts, each possibly minutes long. Zero here, so the
+    # retries the audit log shows are the only retries there are.
+    return ChatAnthropic(model=MODEL, max_tokens=2048, max_retries=0, timeout=60)
 
 
 # ---------------------------------------------------------------------------
@@ -149,15 +164,19 @@ def build_explicit(
     # Day 52: tools after which the run ends without another model call. A
     # worker that has handed off has nothing left to say.
     stop_after: frozenset[str] = frozenset(),
+    # Day 56: retry counts, backoff, and the fallback model.
+    resilience: Resilience = Resilience(),
 ):
     audit = audit or AuditLog()
+    label = (lambda node: f"{name}/{node}") if name else (lambda node: node)
 
     # bind_tools attaches the tool schemas to every request, like passing
     # `tools=TOOLS` to client.messages.create in Month 1.
     llm = (model or default_model()).bind_tools(tools)
+    fallback_llm = resilience.fallback_model.bind_tools(tools) if resilience.fallback_model else None
     tools_by_name = {t.name: t for t in tools}
 
-    def agent(state: AgentState) -> dict:
+    def ask_model(m, state: AgentState) -> dict:
         # The system prompt is prepended per call rather than stored in state,
         # so it never gets duplicated into the history.
         # Day 48: plus the customer block, rebuilt from state each call.
@@ -165,8 +184,11 @@ def build_explicit(
         # tell a late order from an on-time one. returns.today, looked up at
         # call time, so tests that pin the date pin it here too.
         prompt = f"{system}\n\nToday is {returns.today().isoformat()}." + customer_prompt(state.get("customer"))
-        response = llm.invoke([SystemMessage(prompt), *state["messages"]])
+        response = m.invoke([SystemMessage(prompt), *state["messages"]])
         return {"messages": [response], "iterations": state.get("iterations", 0) + 1}
+
+    def agent(state: AgentState) -> dict:
+        return ask_model(llm, state)
 
     def run_tools(state: AgentState) -> dict:
         # Month 1's execute(), per tool call. Errors become ToolMessages with
@@ -206,7 +228,30 @@ def build_explicit(
                         tool=call["name"], args=call["args"], by="policy", rule=verdict.rule, why=verdict.why,
                     )
                 try:
-                    content, status = tool.invoke(call["args"]), "success"
+                    # Day 56: a read that couldn't get an answer is asked
+                    # again; a write is not, because "no answer" doesn't mean
+                    # "didn't happen". One attempt for anything not read-only.
+                    content, status = retry_call(
+                        lambda: tool.invoke(call["args"]),
+                        attempts=resilience.tool_attempts if is_read_only(tool) else 1,
+                        base_delay=resilience.base_delay,
+                        on_retry=lambda attempt, e: audit.record(
+                            "recovery", "retried", node=label("tools"), tool_call_id=call["id"],
+                            tool=call["name"], attempt=attempt, error=repr(e),
+                        ),
+                    ), "success"
+                except ToolUnavailable as e:
+                    # Tell the model what is true and what to do about it, or
+                    # it will call the same dead tool again until
+                    # max_iterations. Same device as the rejection above.
+                    content = {
+                        "error": f"{call['name']} is unavailable: {e}",
+                        "final": "The system behind this tool is not responding. Don't call it "
+                        "again this turn. Tell the customer plainly that you can't check "
+                        "that right now and that they can try again shortly. Don't guess "
+                        "at what it would have said.",
+                    }
+                    status = "error"
                 except (ValidationError, ToolException) as e:
                     # ValidationError is Month 1's TypeError case: arguments the
                     # schema allowed but the function didn't accept.
@@ -296,6 +341,29 @@ def build_explicit(
         # call that would go over the limit is never sent or paid for.
         return "give_up" if state["iterations"] >= max_iterations else "agent"
 
+    def recover(state: AgentState, error: NodeError) -> Command:
+        # Day 56: the graph-level recovery path. Runs when a node raised and
+        # its retries (if any) are used up, instead of the exception leaving
+        # graph.invoke(). It returns a Command: an update to apply, and where
+        # to go next.
+        #
+        # For the model, one more chance first: the fallback, if there is one,
+        # for the failures a second model could fix (an outage or overload,
+        # not a bad request).
+        cause = error.error
+        if error.node == "agent" and fallback_llm is not None and is_transient(cause):
+            try:
+                update = ask_model(fallback_llm, state)
+            except Exception as e:
+                audit.record("recovery", "fallback_failed", node=label(error.node), error=repr(e))
+            else:
+                audit.record("recovery", "fell_back", node=label(error.node), error=repr(cause))
+                # Same routing as after a normal `agent` run: the fallback's
+                # answer may itself ask for tools, or for approval.
+                return Command(update=update, goto=route_after_agent({"messages": update["messages"]}))
+        audit.record("recovery", "gave_up", node=label(error.node), error=repr(cause))
+        return Command(update={"messages": recovery_messages(state["messages"])}, goto=END)
+
     def route_start(state: AgentState) -> Literal["load_customer", "agent"]:
         # "At session start" = the thread has no customer in state yet. The
         # checkpoint answers that; there is no separate session object.
@@ -308,11 +376,14 @@ def build_explicit(
     # Day 49: every node is registered wrapped, so every run of it is logged.
     # Routing functions aren't wrapped: they change no state, and where they
     # sent the run is the next row's `node`.
-    def add(node: str, fn) -> None:
-        g.add_node(node, audited(f"{name}/{node}" if name else node, fn, audit))
+    def add(node: str, fn, **kwargs) -> None:
+        g.add_node(node, audited(label(node), fn, audit), **kwargs)
 
-    add("agent", agent)
-    add("tools", run_tools)
+    # Day 56: both nodes that can fail for reasons outside the graph share the
+    # recovery path, but only `agent` is retried by the node: see resilience.py
+    # for why `tools` retries per call instead.
+    add("agent", agent, retry_policy=resilience.node_retry(), error_handler=recover)
+    add("tools", run_tools, error_handler=recover)
     add("approve", approve)
     add("give_up", give_up)
     if store is None:
