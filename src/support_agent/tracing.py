@@ -115,7 +115,8 @@ class RunTrace(BaseCallbackHandler):
         # Every runnable inside a node inherits its langgraph_node metadata, so
         # that alone matches dozens of runs. The node itself is the one whose
         # own name equals it.
-        if metadata and name and metadata.get("langgraph_node") == name:
+        # "__start__" is LangGraph's own entry node, not one of ours.
+        if metadata and name and not name.startswith("__") and metadata.get("langgraph_node") == name:
             self._start(run_id, name=node_label(metadata))
 
     def on_chain_end(self, outputs, *, run_id, **kwargs):

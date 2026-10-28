@@ -9,6 +9,16 @@ every step is audited, traced and recoverable.
 The question the project answers: **when is multi-agent worth it?** For this
 agent, it isn't, and the section below shows how that was worked out.
 
+## Demo
+
+![The angry-customer flow: late order, refund needing approval, audit trail, chaos tests](docs/demo.gif)
+
+A real run against Claude (single agent, `claude-opus-5`): the customer is
+angry about a late order, the agent finds it, checks eligibility, and the
+₹7,999 refund stops for a human under the ₹5,000 rule. Then the audit trail,
+and the chaos tests that kill the MCP server. Recorded 2026-10-28 with
+`asciinema` ([`docs/demo.cast`](docs/demo.cast)); how: [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md).
+
 ## Architecture
 
 ```mermaid
@@ -84,17 +94,20 @@ The demo flow is in [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md).
 
 ## What was verified, and how
 
-- **Live against Claude:** Days 41-50, including the end-to-end scenario
-  (`failures.md`: six failures found, five fixed and re-run).
-- **Offline only:** everything from Day 51 on (supervisor, handoffs, shared
-  state, escalation, resilience, tracing). The API credit ran out. The
-  scripted-model tests exercise the graph, policy, audit log and recovery
-  paths for real; what they can't tell you is how Claude behaves inside
-  them. Two things are owed against the live API: `scripts/e2e.py --reject`,
-  and the cost and latency comparison between the designs (the numbers
-  below for the multi-agent versions are counted from the graph, not measured).
+- **Live against Claude:** the single agent, including the end-to-end scenario
+  (`failures.md`: six failures found and fixed, the last one, F6, confirmed
+  on 2026-10-28), and two supervisor runs on 2026-10-28 that reached the
+  approval gate and found three more problems (F7-F9, not all fixed).
+- **Offline only:** the rest: shared state, escalation
+  transfer, handoff limits, resilience paths, and the supervisor's
+  recovery. The scripted-model tests exercise the graph, policy, audit log
+  and recovery for real; what they can't tell you is how Claude behaves
+  inside them, which is what F8 is about. Still owed live: the cost
+  comparison between designs under controlled turns (the multi-agent
+  numbers below are counted from the graph, plus the two indicative runs in
+  `failures.md` F9).
 
-## When something breaks (Day 56)
+## When something breaks
 
 | Failure | What happens | Where |
 |---|---|---|
@@ -112,20 +125,22 @@ read-only (from the MCP server's own `readOnlyHint`). Timeouts are per call
 too: LangGraph's node `timeout` only works on async nodes, and this graph
 is sync.
 
-## Seeing what a conversation cost (Day 57)
+## Seeing what a conversation cost
 
 `scripts/chat.py` writes every node, model call and tool call to
 `data/runs/<thread>.jsonl` and prints a summary on exit:
 
 ```
-thread t
-  model   2 calls (0 failed)  2000 in / 100 out tokens  $0.0053  0.0s
-  tools   1 calls (0 failed)  0.00s
-  node    agent                    2 runs    0.00s
-  node    tools                    1 runs    0.00s
+thread e2e
+  model   5 calls (0 failed)  17329 in / 1160 out tokens  $0.1156  21.1s
+  tools   3 calls (0 failed)  0.00s
+  node    agent                    5 runs   21.11s
+  node    tools                    3 runs    0.00s
+  node    approve                  2 runs    0.00s
+  node    load_customer            1 runs    0.00s
 ```
 
-(That is the format, from a scripted run with made-up usage numbers: no live run has been traced yet.)
+That is the live end-to-end scenario (`scripts/e2e.py --reject`, 2026-10-28).
 It's a callback handler passed through the graph config, so workers inside
 the supervisor are traced with no change to any node. Cached tokens are
 priced at the cache rate, and a model without a price is counted as
@@ -143,14 +158,14 @@ log:
 | ... + handoffs | the same, `transfer_to_*` tools | a worker can pass the case on directly | the receiver sees the sender's note |
 | ... + shared state | `build_supervisor(shared=True)` | supervisor | conversation + shared case file |
 
-### What each costs, on the Day 50 scenario
+### What each costs, on the end-to-end scenario
 
 The angry customer, late order 1048, refund over the approval threshold, two
 customer turns. Model calls per design:
 
 | Design | Model calls | How the number was obtained |
 |---|---|---|
-| Single agent | **5** | measured: Day 50 live run 2 (`failures.md`) |
+| Single agent | **5** | measured: live run 2 of the end-to-end scenario (`failures.md`) |
 | Supervisor | ~11 | counted from the graph: 5 supervisor calls (route, route, finish; route, finish) + 6 worker calls |
 | Supervisor + handoff | ~10 | the handoff saves the supervisor call between order_agent and returns_agent |
 | Shared state | ~11, with longer prompts | as the supervisor, and every worker prompt also carries the conversation and case file |
@@ -168,7 +183,7 @@ same goes for latency, since the calls are sequential.
 | Smaller prompts and tool lists per agent | Yes, once a single agent has too many tools to choose from reliably | **No.** The single agent has 7 tools; that's well within what one prompt handles |
 | Hard permission boundaries | Weaker than it looks | **No.** `policy.py` gates actions per call, inside every design. Moving a tool to another agent isn't a security boundary; the policy is |
 | A different model per role (cheap router, strong worker) | Yes | **Possible**, not done: routing is the obvious Haiku candidate, but not measured |
-| Parallel work | Yes, for independent lookups | **Not used.** Day 45's map-reduce got parallelism inside one graph without extra agents |
+| Parallel work | Yes, for independent lookups | **Not used.** The map-reduce in `wismo.py` got parallelism inside one graph without extra agents |
 | Separate ownership: teams, prompts, evals per domain | Yes, organisationally | **No.** One developer, one domain |
 
 ### The failure modes it adds
@@ -205,8 +220,8 @@ least one of these holds:
    shipping its own prompts and evals.
 
 The cheapest step that's still worth having isn't multi-agent at all: a
-**router** (one cheap classification call, or Day 41's keyword
-`classify`) in front of narrower single agents. If the traces show one hop
+**router** (one cheap classification call, or the keyword
+`classify` in `graph.py`) in front of narrower single agents. If the traces show one hop
 per turn, that's what the supervisor was anyway.
 
 ## Escalation, and why it looks like contact-centre integration

@@ -17,12 +17,11 @@ keep.
 | 1 | before fixes | approves | **2/5** | F1–F4 found |
 | 2 | F1–F4 fixed | approves | **5/5** | F5 found |
 | 3 | F1–F4 fixed | rejects | 4/5 | F6 found; the judge was also wrong (expected a return after a rejection) |
-| 4 | F6 fixed, judge fixed | rejects | **not run** | API credit exhausted (HTTP 400 "credit balance is too low") |
+| 4 | F6 fixed, judge fixed | rejects | **5/5** | run 2026-10-28 after credit was added: 5 model calls, $0.1156, 21s |
 
-**Run 4 is owed.** F6's fix is covered offline by
-`test_f6_rejection_tells_the_model_not_to_route_around_it`, but has not been
-seen working against Claude. Re-run `uv run python scripts/e2e.py --reject`
-once credit is back, and record it here.
+Run 4 (2026-10-28) confirmed the F6 fix live: the reviewer's rejection
+was reported to the customer as "not approved", with no return and no
+escalation the customer didn't ask for.
 
 ## Failures found, and what was done
 
@@ -80,7 +79,7 @@ was wrong.
 prompt against. It belongs in Month 4's eval set as a rubric item
 ("acknowledges frustration before solving").
 
-### F6: escalated to get a human's rejection overturned — fixed, unverified live
+### F6: escalated to get a human's rejection overturned — fixed, verified live (run 4)
 **Seen (run 3):** the reviewer rejected the refund. Claude then called
 `escalate_to_human` "to get that actioned", and told the customer only that
 "no refund has been issued", never that it was declined. That's an agent
@@ -94,6 +93,52 @@ rejection.
 **Tests:** `test_f6_*` (the message), and
 `test_judge_catches_escalating_around_a_rejection` (run 3 replayed; the
 judge must fail it).
+
+## Supervisor, first live runs (2026-10-28)
+
+`scripts/chat.py --supervisor --customer C-100`, same customer opening line
+as the scenario. Two runs (`livecheck1`, `livecheck2`; the audit log and
+`data/runs/` hold them). These are the first times Days 51-54 ran against
+Claude.
+
+### F7: a stale seed hid the order the scenario is about — fixed (data), cause open
+**Seen (livecheck1):** the supervisor never mentioned order 1048; the
+workers worked on 1042, found it "not late", and the flow never reached the
+approval gate. The persisted profile in `data/memory.sqlite` was seeded on
+Day 48 and `seed_profiles` never overwrites, so it never gained 1048 when
+Day 50 added it. `scripts/e2e.py` doesn't show this: it seeds a fresh
+in-memory store.
+**Fix:** the stored C-100 profile was refreshed from `PROFILES` by hand
+(notes untouched). **Open:** the same drift will recur for any profile
+change. The CRM record probably shouldn't be a never-overwrite seed.
+
+### F8: the supervisor path offers options nothing grounds, and acts without a confirmation — open
+**Seen (livecheck1, livecheck2):** the order agent (which has no return
+tool) proposed "refuse-on-delivery / return-to-sender" in its handoff note
+before anything said it was possible; in livecheck1 the returns agent
+retracted it ("please disregard that option") and a later reply promised
+"I'll email you as soon as delivery registers", a follow-up nothing
+performs (F3 again, from the supervisor's reply). In livecheck2 the final
+reply offered "you can refuse delivery" *after the refund was rejected*,
+when no return existed. (The same phrase in the single-agent demo recording
+is grounded: `create_return`'s own `next_step` says it.)
+Separately, in livecheck2 the returns agent called `create_return` on the
+customer's first message, before the "Yes, refund it" the single-agent
+flow waits for. The human gate caught it, but the confirmation rule in the
+worker prompt didn't hold across the brief.
+**Not fixed.** One more sample of what the README says: every hop is a
+chance to lose a constraint. Candidates for next: put the confirmation rule
+and "only offer what a tool's result says" in the supervisor's prompt too,
+and add both as Month 4 rubric items.
+
+### F9: first measured costs for the supervisor path
+livecheck2 (to the approval gate, rejected by mistake, see below): 7 model
+calls, $0.1880, 50s. livecheck1 (three customer turns): 16 calls, $0.3372,
+90s. The single agent's e2e run 4 for comparison: 5 calls, $0.1156, 21s.
+Different customer turns, so this is indicative, not a controlled
+comparison, but 7 vs 5 calls to the same decision point agrees with the
+README's estimate. (livecheck2's reviewer rejection was a piping mistake:
+the scripted stdin fed "Yes. Refund it." to the `approve?` prompt.)
 
 ## Known gaps (not failures, carry forward)
 
